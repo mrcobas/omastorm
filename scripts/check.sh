@@ -88,6 +88,8 @@ step clippy bash scripts/cargo.sh clippy --offline --locked --all-targets -- -D 
 # start without compiling under each other. Without them there is nothing
 # to run, and each window would only wait out its timeout.
 if step build bash scripts/cargo.sh test --offline --locked --no-run; then
+  # Keep all lanes on the same executable, including dev-only Cargo features.
+  export OMASTORM_CHECK_PREBUILT=1
   # The UI checks assume the archived KTLX scan; a fresh daemon shows it when
   # OMASTORM_ARCHIVE names the volume (a shipped daemon starts with no frame).
   export OMASTORM_ARCHIVE="$PWD/data/raw/KTLX20130520_201643_V06.gz"

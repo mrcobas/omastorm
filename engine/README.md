@@ -121,3 +121,6 @@ GPU precision; other mismatches fail. A second test pans the full map by whole
 3 px cells and checks that radar, tiles, and overlays shift together within
 premultiplied rounding tolerance, without relaying out labels or crossing a
 tile edge. Captures and validation reports are written to `review/`.
+
+During `mise check`, test launches reuse the prebuilt engine so parallel lanes
+do not replace it with a build using a different Cargo feature set.

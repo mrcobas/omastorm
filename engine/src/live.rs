@@ -656,6 +656,7 @@ mod tests {
     struct RecordedFeed {
         starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         active_chunks: usize,
+        discoveries: Sender<usize>,
     }
 
     fn recorded_chunk(volume: usize) -> DownloadedChunk {
@@ -677,6 +678,7 @@ mod tests {
             use nexrad_data::aws::realtime::RetryPolicy;
             use std::sync::atomic::Ordering;
             let generation = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.discoveries.send(generation).await.unwrap();
             let latest_chunk = recorded_chunk(generation);
             Ok(ChunkIteratorInit {
                 iterator: ChunkIterator::from_chunk(
@@ -736,9 +738,11 @@ mod tests {
                 // All waits, including the production watchdog, use this clock.
                 tokio::time::pause();
                 let starts = Arc::new(AtomicUsize::new(0));
+                let (discoveries, mut discovered) = tokio::sync::mpsc::channel(8);
                 let feed = RecordedFeed {
                     starts: starts.clone(),
                     active_chunks,
+                    discoveries,
                 };
                 let (events, mut received) = tokio::sync::mpsc::channel(32);
                 let task =
@@ -757,18 +761,21 @@ mod tests {
                         "healthy chunks must not restart discovery"
                     );
                 }
+                assert_eq!(discovered.recv().await, Some(1));
                 let last_chunk = Instant::now();
                 assert!(
-                    timeout(QUIET_RESTART - Duration::from_secs(1), received.recv())
+                    timeout(QUIET_RESTART - Duration::from_secs(1), discovered.recv())
                         .await
                         .is_err(),
                     "do not restart before a full quiet interval after the last actual chunk"
                 );
                 assert_eq!(starts.load(Ordering::SeqCst), 1);
-                let recovered = timeout(MAX_WAIT + Duration::from_secs(2), received.recv()).await;
+                // Observe discovery itself: replaying the same fixture is not
+                // required, so a future duplicate-sweep filter remains valid.
+                let recovered = timeout(MAX_WAIT + Duration::from_secs(2), discovered.recv()).await;
                 assert!(
-                    matches!(recovered, Ok(Some(Event::Sweep { complete: true, .. }))),
-                    "quiet polling must rediscover and deliver a complete sweep without reselecting"
+                    matches!(recovered, Ok(Some(2))),
+                    "quiet polling must rediscover without reselecting"
                 );
                 assert_eq!(starts.load(Ordering::SeqCst), 2);
                 assert!(last_chunk.elapsed() >= QUIET_RESTART);
@@ -777,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn quiet_poll_loop_rediscovers_and_delivers_a_sweep() {
+    fn quiet_poll_loop_rediscovers_after_deadline() {
         check_loop_recovery(0);
     }
 

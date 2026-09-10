@@ -23,7 +23,11 @@ if [[ ! -f ui/shaders/radar.frag.qsb || ! -f ui/shaders/tile.frag.qsb ]]; then
   exit 1
 fi
 # Launch is strictly offline. Fetch build dependencies explicitly during setup.
-bash scripts/cargo.sh build --offline --locked --quiet
+# check.sh already built every test target. Rebuilding without dev features
+# here could replace the executable while parallel checks hash or launch it.
+if [[ ${OMASTORM_CHECK_PREBUILT:-0} != 1 ]]; then
+  bash scripts/cargo.sh build --offline --locked --quiet
+fi
 target/debug/omastorm-engine ensure
 # A tty launch names this checkout and which files apply, so a leftover
 # archive daemon or the installed plugin is obvious. Captures are not a tty.
