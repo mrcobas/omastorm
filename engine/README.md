@@ -109,6 +109,10 @@ catalog retention, deterministic tile rendering, cache eviction, protocol
 validation, client isolation, daemon replacement, and texture retirement.
 Recorded vector-tile fixtures have provenance in `data/vt/tiles.json`.
 
+Live poll-loop regressions use the public radar fixture and a paused Tokio clock.
+They verify rediscovery after a quiet interval and that received chunks reset
+the deadline, without network requests or a wall-clock wait for the watchdog.
+
 The rendering check compares all three treatments against the shader's sampling
 rule replayed in Rust over golden codes. It checks default and zoomed views,
 weak-return filtering, folded and below-threshold codes, and coverage edges.

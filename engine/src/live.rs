@@ -18,16 +18,16 @@
 use crate::sweep::Sweep;
 use chrono::{SecondsFormat, Utc};
 use nexrad_data::aws::realtime::{
-    Chunk, ChunkIdentifier, ChunkIterator, DownloadedChunk, VolumeIndex, download_chunk,
-    list_chunks_in_volume,
+    Chunk, ChunkIdentifier, ChunkIterator, ChunkIteratorInit, DownloadedChunk, VolumeIndex,
+    download_chunk, list_chunks_in_volume,
 };
 use nexrad_data::result::{Error, aws::AWSError};
 use nexrad_data::volume::Record;
 use nexrad_model::data::{Radial, RadialStatus};
-use std::time::{Duration, Instant};
+use std::{future::Future, time::Duration};
 use tokio::{
     sync::mpsc::Sender,
-    time::{sleep, timeout},
+    time::{Instant, sleep, timeout},
 };
 
 /// NOAA's real-time bucket, named in frame provenance (`nexrad-data` owns
@@ -416,14 +416,61 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Network boundary for the poll loop. Tests substitute recorded chunks while
+/// running the same discovery, timeout, replay, and recovery control flow.
+trait Feed: Send {
+    fn start(
+        &mut self,
+        site: &str,
+    ) -> impl Future<Output = Result<ChunkIteratorInit, Error>> + Send {
+        ChunkIterator::start(site)
+    }
+
+    fn next(
+        &mut self,
+        iterator: &mut ChunkIterator,
+    ) -> impl Future<Output = Result<Option<DownloadedChunk>, Error>> + Send {
+        iterator.try_next()
+    }
+
+    fn replay(
+        &mut self,
+        site: &str,
+        iterator: &ChunkIterator,
+        newest: &ChunkIdentifier,
+        have_start: bool,
+    ) -> impl Future<Output = Vec<DownloadedChunk>> + Send {
+        earlier_chunks(site, iterator, newest, have_start)
+    }
+
+    fn backfill(
+        &mut self,
+        site: String,
+        events: Sender<Event>,
+        current: VolumeIndex,
+        cached: Vec<i64>,
+    ) -> Option<AbortOnDrop> {
+        Some(AbortOnDrop(tokio::spawn(backfill(
+            site, events, current, cached,
+        ))))
+    }
+}
+
+struct Noaa;
+impl Feed for Noaa {}
+
 /// Poll `site` until the task is aborted or the event channel closes.
 /// `cached` holds the start times of the frames already catalogued for the
 /// station, so the backfill does not fetch them again.
 pub async fn poll(site: String, events: Sender<Event>, cached: Vec<i64>) {
+    poll_with(Noaa, site, events, cached).await;
+}
+
+async fn poll_with(mut feed: impl Feed, site: String, events: Sender<Event>, cached: Vec<i64>) {
     let mut back_off = BACK_OFF;
     let mut backfilling: Option<AbortOnDrop> = None;
     loop {
-        let init = match timeout(START_TIMEOUT, ChunkIterator::start(&site)).await {
+        let init = match timeout(START_TIMEOUT, feed.start(&site)).await {
             Ok(Ok(init)) => init,
             Ok(Err(e)) => {
                 // An empty listing is the bucket's answer, not its absence.
@@ -461,13 +508,14 @@ pub async fn poll(site: String, events: Sender<Event>, cached: Vec<i64>) {
         // Replay the volume so far: the Start chunk, the chunks between it
         // and the newest that the VCP maps to the lowest cut, and the newest.
         let newest = init.latest_chunk;
-        let mut replay = earlier_chunks(
-            &site,
-            &iterator,
-            &newest.identifier,
-            init.start_chunk.is_some(),
-        )
-        .await;
+        let mut replay = feed
+            .replay(
+                &site,
+                &iterator,
+                &newest.identifier,
+                init.start_chunk.is_some(),
+            )
+            .await;
         if let Some(start) = init.start_chunk {
             replay.insert(0, start);
         }
@@ -481,12 +529,12 @@ pub async fn poll(site: String, events: Sender<Event>, cached: Vec<i64>) {
             ),
         );
         if backfilling.is_none() {
-            backfilling = Some(AbortOnDrop(tokio::spawn(backfill(
+            backfilling = feed.backfill(
                 site.clone(),
                 events.clone(),
                 *newest.identifier.volume(),
                 cached.clone(),
-            ))));
+            );
         }
         replay.push(newest);
         let mut previous_volume = None;
@@ -500,7 +548,7 @@ pub async fn poll(site: String, events: Sender<Event>, cached: Vec<i64>) {
         let mut failures = 0;
         let mut last_chunk = Instant::now();
         loop {
-            match timeout(CALL_TIMEOUT, iterator.try_next()).await {
+            match timeout(CALL_TIMEOUT, feed.next(&mut iterator)).await {
                 Ok(Ok(Some(chunk))) => {
                     failures = 0;
                     last_chunk = Instant::now();
@@ -509,8 +557,9 @@ pub async fn poll(site: String, events: Sender<Event>, cached: Vec<i64>) {
                     // landed fetches the ones it skipped first.
                     if previous_volume != Some(*chunk.identifier.volume()) {
                         previous_volume = Some(*chunk.identifier.volume());
-                        for skipped in
-                            earlier_chunks(&site, &iterator, &chunk.identifier, false).await
+                        for skipped in feed
+                            .replay(&site, &iterator, &chunk.identifier, false)
+                            .await
                         {
                             if !deliver(&mut assembler, &site, &skipped, &events).await {
                                 return;
@@ -601,6 +650,141 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../data/raw/KTLX20130520_201643_V06.gz"
     );
+
+    /// A fixture-only source. Each discovery supplies one complete sweep;
+    /// subsequent chunks can keep the feed active before it becomes quiet.
+    struct RecordedFeed {
+        starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        active_chunks: usize,
+    }
+
+    fn recorded_chunk(volume: usize) -> DownloadedChunk {
+        DownloadedChunk {
+            identifier: ChunkIdentifier::from_name(
+                "KTLX".into(),
+                VolumeIndex::new(volume),
+                "20130520-201643-001-S".into(),
+                None,
+            )
+            .unwrap(),
+            chunk: Chunk::Start(File::new(fs::read(FIXTURE).unwrap()).decompress().unwrap()),
+            attempts: 1,
+        }
+    }
+
+    impl Feed for RecordedFeed {
+        async fn start(&mut self, site: &str) -> Result<ChunkIteratorInit, Error> {
+            use nexrad_data::aws::realtime::RetryPolicy;
+            use std::sync::atomic::Ordering;
+            let generation = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            let latest_chunk = recorded_chunk(generation);
+            Ok(ChunkIteratorInit {
+                iterator: ChunkIterator::from_chunk(
+                    site,
+                    latest_chunk.identifier.clone(),
+                    RetryPolicy::default_download(),
+                    RetryPolicy::default_discovery(),
+                ),
+                latest_chunk,
+                start_chunk: None,
+            })
+        }
+
+        async fn next(
+            &mut self,
+            _iterator: &mut ChunkIterator,
+        ) -> Result<Option<DownloadedChunk>, Error> {
+            if self.active_chunks == 0 {
+                return Ok(None);
+            }
+            self.active_chunks -= 1;
+            sleep(Duration::from_secs(20)).await;
+            Ok(Some(recorded_chunk(1)))
+        }
+
+        async fn replay(
+            &mut self,
+            _site: &str,
+            _iterator: &ChunkIterator,
+            _newest: &ChunkIdentifier,
+            _have_start: bool,
+        ) -> Vec<DownloadedChunk> {
+            Vec::new()
+        }
+
+        fn backfill(
+            &mut self,
+            _site: String,
+            _events: Sender<Event>,
+            _current: VolumeIndex,
+            _cached: Vec<i64>,
+        ) -> Option<AbortOnDrop> {
+            None
+        }
+    }
+
+    fn check_loop_recovery(active_chunks: usize) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // All waits, including the production watchdog, use this clock.
+                tokio::time::pause();
+                let starts = Arc::new(AtomicUsize::new(0));
+                let feed = RecordedFeed {
+                    starts: starts.clone(),
+                    active_chunks,
+                };
+                let (events, mut received) = tokio::sync::mpsc::channel(32);
+                let task =
+                    AbortOnDrop(tokio::spawn(poll_with(feed, "KTLX".into(), events, vec![])));
+                for _ in 0..=active_chunks {
+                    assert!(
+                        matches!(
+                            timeout(CALL_TIMEOUT, received.recv()).await,
+                            Ok(Some(Event::Sweep { complete: true, .. }))
+                        ),
+                        "discovery and each healthy chunk must deliver a complete fixture sweep"
+                    );
+                    assert_eq!(
+                        starts.load(Ordering::SeqCst),
+                        1,
+                        "healthy chunks must not restart discovery"
+                    );
+                }
+                let last_chunk = Instant::now();
+                assert!(
+                    timeout(QUIET_RESTART - Duration::from_secs(1), received.recv())
+                        .await
+                        .is_err(),
+                    "do not restart before a full quiet interval after the last actual chunk"
+                );
+                assert_eq!(starts.load(Ordering::SeqCst), 1);
+                let recovered = timeout(MAX_WAIT + Duration::from_secs(2), received.recv()).await;
+                assert!(
+                    matches!(recovered, Ok(Some(Event::Sweep { complete: true, .. }))),
+                    "quiet polling must rediscover and deliver a complete sweep without reselecting"
+                );
+                assert_eq!(starts.load(Ordering::SeqCst), 2);
+                assert!(last_chunk.elapsed() >= QUIET_RESTART);
+                drop(task);
+            });
+    }
+
+    #[test]
+    fn quiet_poll_loop_rediscovers_and_delivers_a_sweep() {
+        check_loop_recovery(0);
+    }
+
+    #[test]
+    fn healthy_chunks_reset_the_poll_loop_quiet_deadline() {
+        check_loop_recovery(3);
+    }
 
     /// Every radial of the fixture volume in decoded order (the archive is
     /// one uncompressed record, so records cannot stand in for chunks).
