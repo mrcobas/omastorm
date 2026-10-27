@@ -21,8 +21,9 @@ jobs:
       matrix:
         runner: ["ubuntu-24.04", "ubuntu-24.04-arm"]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 8
+    timeout-minutes: 20
     env:
+      CI_TRUST_APT: '1'
       CI_TRUST_PROBE: '1'
     steps:
       - name: Prepare scoped CI certificate trust before actions
@@ -126,7 +127,7 @@ jobs:
           # APT/GnuTLS does not inherit Node/curl trust settings. Configure its supported
           # CAInfo explicitly before owned package bootstrap; preserve package signing keys.
           apt_helper=pathlib.Path('/usr/lib/apt/apt-helper')
-          if sys.platform.startswith('linux') and apt_helper.is_file():
+          if os.environ.get('CI_TRUST_APT') == '1' and sys.platform.startswith('linux') and apt_helper.is_file():
               assert os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted'
               import re,tempfile
               apt_dir=pathlib.Path('/etc/apt/cobas-ci')
@@ -238,3 +239,26 @@ jobs:
         run: python3 .github/scripts/runner-dotnet-probe.py
       - name: Verify actual Git HTTPS trust without credentials
         run: python3 .github/scripts/ci-git-trust.py
+
+      - name: Native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config binutils socat
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - name: Qualify actual bootstrap downloader clients
+        timeout-minutes: 5
+        run: python3 .github/scripts/ci-bootstrap-clients.py
+
+      - name: Extract verified fixtures and fetch locked dependencies
+        run: |
+          bash scripts/setup-fixture.sh
+          bash scripts/cargo.sh fetch --locked
+      - name: Qualify locked engine HTTPS verifier
+        run: |
+          # Raw provider trust is recorded independently; the scoped job verifier is the gate.
+          if env -u SSL_CERT_FILE -u SSL_CERT_DIR -u CURL_CA_BUNDLE -u REQUESTS_CA_BUNDLE -u GIT_SSL_CAINFO -u GIT_SSL_CAPATH -u CARGO_HTTP_CAINFO bash scripts/cargo.sh test --offline --locked --test tls_trust -- --ignored --nocapture; then
+            printf '%s\n' 'raw_engine_provider_store=qualified'
+          else
+            printf '%s\n' 'raw_engine_provider_store=unqualified; scoped job trust does not attest an unpatched deployment host'
+          fi
+          bash scripts/cargo.sh test --offline --locked --test tls_trust -- --ignored --nocapture
